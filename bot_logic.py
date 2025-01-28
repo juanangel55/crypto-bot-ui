@@ -34,14 +34,31 @@ def fetch_token_data(token_address):
     """Fetch token data from DexScreener."""
     response = requests.get(f"{DEXSCREENER_API_URL}{token_address}")
     if response.status_code == 200:
-        return response.json()
+        data = response.json()
+        if data and isinstance(data, dict) and 'pairs' in data:
+            return data
+        else:
+            print(f"Invalid data structure for token: {token_address}")
     else:
         print(f"Failed to fetch data for token: {token_address}")
-        return None
+    return None
 
 def is_blacklisted(token_data):
     """Check if a token or its developer is blacklisted."""
-    token = token_data.get('pairs', [{}])[0]
+    if not token_data or not isinstance(token_data, dict):
+        print("Invalid token data provided.")
+        return False
+
+    pairs = token_data.get('pairs', [])
+    if not pairs or not isinstance(pairs, list):
+        print("No pairs data found.")
+        return False
+
+    token = pairs[0] if pairs else {}
+    if not token or not isinstance(token, dict):
+        print("Invalid token data in pairs.")
+        return False
+
     token_address = token.get('baseToken', {}).get('address')
     dev_address = token.get('baseToken', {}).get('deployer')
 
@@ -51,6 +68,7 @@ def is_blacklisted(token_data):
     if dev_address in DEV_BLACKLIST:
         print(f"Token {token_address} is created by blacklisted dev {dev_address}.")
         return True
+
     return False
 
 def passes_filters(token_data):
@@ -164,15 +182,15 @@ def execute_trade(action, token_address, amount):
 
 def save_token_data(token_data):
     """Save token data to the database if it passes all checks."""
+    if not token_data or not isinstance(token_data, dict):
+        print("Invalid token data provided.")
+        return
+
     if is_blacklisted(token_data):
         return
     if not passes_filters(token_data):
         return
     if is_fake_volume(token_data):
-        return
-
-    update_blacklists(token_data)
-    if is_blacklisted(token_data):
         return
 
     conn = sqlite3.connect("dex_data.db")
