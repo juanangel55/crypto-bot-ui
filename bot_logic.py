@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import psycopg2
 from sqlalchemy import create_engine
 from typing import Dict, List, Optional
-from sklearn.ensemble import IsolationForest
 
 # Enhanced Configuration
 CONFIG = {
