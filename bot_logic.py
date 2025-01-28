@@ -1,243 +1,212 @@
+import json
+import sqlite3
 import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import psycopg2
-from sqlalchemy import create_engine
-from typing import Dict, List, Optional
-from sklearn.ensemble import IsolationForest
+import time
+from bs4 import BeautifulSoup
+from telegram import Bot
 
-# Enhanced Configuration
-CONFIG = {
-    "DB": {
-        "dbname": "dexscreener",
-        "user": "admin",
-        "password": "your_password",
-        "host": "localhost",
-        "port": "5432"
-    },
-    "FILTERS": {
-        "min_liquidity": 5000,  # USD
-        "min_age_days": 3,
-        "coin_blacklist": [
-            "0x123...def",  # Known scam token address
-            "SUSPECTCOIN"   # Blacklisted symbol
-        ],
-        "dev_blacklist": [
-            "0x456...abc",  # Known rug developer address
-            "0x789...fed"   # Another scam developer
-        ],
-        "chain_whitelist": ["ethereum", "binance-smart-chain"]
+# Load config file
+with open("config.json", "r") as f:
+    config = json.load(f)
+
+# Extract settings
+FILTERS = config["filters"]
+COIN_BLACKLIST = set(config["blacklist"]["coins"])
+DEV_BLACKLIST = set(config["blacklist"]["devs"])
+FAKE_VOLUME_SETTINGS = config["fake_volume_detection"]
+RUGCHECK_SETTINGS = config["rugcheck"]
+BUNDLED_SUPPLY_SETTINGS = config["bundled_supply"]
+
+# API URLs and keys
+DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/tokens/"
+RUGCHECK_API_URL = "https://api.rugcheck.xyz/v1/check"
+ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+ETHERSCAN_API_KEY = "your_etherscan_api_key"
+BONKBOT_API_URL = "https://api.bonkbot.com/v1/trade"
+BONKBOT_API_KEY = "your_bonkbot_api_key"
+TELEGRAM_BOT_TOKEN = "your_telegram_bot_token"
+TELEGRAM_CHAT_ID = "your_telegram_chat_id"
+
+# Initialize Telegram bot
+telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+def fetch_token_data(token_address):
+    """Fetch token data from DexScreener."""
+    response = requests.get(f"{DEXSCREENER_API_URL}{token_address}")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to fetch data for token: {token_address}")
+        return None
+
+def is_blacklisted(token_data):
+    """Check if a token or its developer is blacklisted."""
+    token = token_data.get('pairs', [{}])[0]
+    token_address = token.get('baseToken', {}).get('address')
+    dev_address = token.get('baseToken', {}).get('deployer')
+
+    if token_address in COIN_BLACKLIST:
+        print(f"Token {token_address} is blacklisted.")
+        return True
+    if dev_address in DEV_BLACKLIST:
+        print(f"Token {token_address} is created by blacklisted dev {dev_address}.")
+        return True
+    return False
+
+def passes_filters(token_data):
+    """Check if a token passes the defined filters."""
+    token = token_data.get('pairs', [{}])[0]
+    liquidity = token.get('liquidity', {}).get('usd', 0)
+    volume_24h = token.get('volume', {}).get('h24', 0)
+    market_cap = token.get('fdv', 0)
+
+    if liquidity < FILTERS["min_liquidity"]:
+        print(f"Token {token['baseToken']['address']} fails liquidity filter.")
+        return False
+    if volume_24h < FILTERS["min_volume_24h"]:
+        print(f"Token {token['baseToken']['address']} fails 24h volume filter.")
+        return False
+    if market_cap > FILTERS["max_market_cap"]:
+        print(f"Token {token['baseToken']['address']} fails market cap filter.")
+        return False
+    return True
+
+def is_fake_volume(token_data):
+    """Detect fake volume using an algorithmic approach."""
+    token = token_data.get('pairs', [{}])[0]
+    liquidity = token.get('liquidity', {}).get('usd', 0)
+    volume_24h = token.get('volume', {}).get('h24', 0)
+    price_change = token.get('priceChange', {}).get('h24', 0)
+
+    if liquidity > 0 and volume_24h / liquidity > FAKE_VOLUME_SETTINGS["volume_liquidity_ratio_threshold"]:
+        print(f"Token {token['baseToken']['address']} has suspicious volume/liquidity ratio.")
+        return True
+    if volume_24h > 100000 and abs(price_change) < FAKE_VOLUME_SETTINGS["price_stability_threshold"]:
+        print(f"Token {token['baseToken']['address']} has high volume but stable price.")
+        return True
+    return False
+
+def fetch_rugcheck_data(token_address):
+    """Fetch contract rating from RugCheck.xyz."""
+    response = requests.get(f"{RUGCHECK_API_URL}?address={token_address}")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to fetch RugCheck data for token: {token_address}")
+        return None
+
+def is_supply_bundled(token_address):
+    """Check if the token's supply is bundled."""
+    params = {
+        "module": "account",
+        "action": "tokenbalance",
+        "contractaddress": token_address,
+        "address": "0xLargestHolderAddress",  # Replace with logic to fetch largest holder
+        "tag": "latest",
+        "apikey": ETHERSCAN_API_KEY
     }
-}
+    response = requests.get(ETHERSCAN_API_URL, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        largest_holder_balance = int(data.get("result", 0))
+        total_supply = fetch_total_supply(token_address)
+        if total_supply > 0 and largest_holder_balance / total_supply > BUNDLED_SUPPLY_SETTINGS["threshold"]:
+            return True
+    return False
 
-class EnhancedDexScreenerBot:
-    def __init__(self):
-        self.engine = create_engine(
-            f'postgresql+psycopg2://{CONFIG["DB"]["user"]}:{CONFIG["DB"]["password"]}'
-            f'@{CONFIG["DB"]["host"]}/{CONFIG["DB"]["dbname"]}'
-        )
-        self._init_db()
-        self.model = IsolationForest(n_estimators=100, contamination=0.01)
-        self.historical_data = self._load_historical_data()
+def fetch_total_supply(token_address):
+    """Fetch the total supply of a token."""
+    params = {
+        "module": "stats",
+        "action": "tokensupply",
+        "contractaddress": token_address,
+        "apikey": ETHERSCAN_API_KEY
+    }
+    response = requests.get(ETHERSCAN_API_URL, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        return int(data.get("result", 0))
+    return 0
 
-    def _init_db(self):
-        """Initialize database with additional security tables"""
-        with self.engine.connect() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS blacklist (
-                    address VARCHAR(42) PRIMARY KEY,
-                    type VARCHAR(20) CHECK (type IN ('coin', 'dev')),
-                    reason TEXT,
-                    listed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
+def update_blacklists(token_data):
+    """Update blacklists based on RugCheck rating and bundled supply."""
+    token = token_data.get('pairs', [{}])[0]
+    token_address = token.get('baseToken', {}).get('address')
+    dev_address = token.get('baseToken', {}).get('deployer')
 
-                CREATE INDEX IF NOT EXISTS idx_blacklist_type ON blacklist(type);
-            """)
-            # Migrate config blacklists to database
-            self._seed_initial_blacklists()
+    rugcheck_data = fetch_rugcheck_data(token_address)
+    if rugcheck_data and rugcheck_data.get("rating") != RUGCHECK_SETTINGS["min_rating"]:
+        print(f"Token {token_address} is marked as {rugcheck_data.get('rating')} on RugCheck.")
+        COIN_BLACKLIST.add(token_address)
+        DEV_BLACKLIST.add(dev_address)
 
-    def _seed_initial_blacklists(self):
-        """Initialize blacklists from config"""
-        with self.engine.connect() as conn:
-            # Seed coin blacklist
-            for address in CONFIG["FILTERS"]["coin_blacklist"]:
-                conn.execute(
-                    """INSERT INTO blacklist (address, type)
-                       VALUES (%s, 'coin')
-                       ON CONFLICT (address) DO NOTHING""",
-                    (address,)
-                )
-            
-            # Seed dev blacklist
-            for address in CONFIG["FILTERS"]["dev_blacklist"]:
-                conn.execute(
-                    """INSERT INTO blacklist (address, type)
-                       VALUES (%s, 'dev')
-                       ON CONFLICT (address) DO NOTHING""",
-                    (address,)
-                )
+    if is_supply_bundled(token_address):
+        print(f"Token {token_address} has a bundled supply.")
+        COIN_BLACKLIST.add(token_address)
+        DEV_BLACKLIST.add(dev_address)
 
-    def apply_filters(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply all security and quality filters"""
-        # Chain whitelist filter
-        df = df[df['chain'].isin(CONFIG["FILTERS"]["chain_whitelist"])]
-        
-        # Liquidity filter
-        df = df[df['liquidity'] >= CONFIG["FILTERS"]["min_liquidity"]]
-        
-        # Age filter
-        min_age = datetime.utcnow() - timedelta(days=CONFIG["FILTERS"]["min_age_days"])
-        df = df[pd.to_datetime(df['created_at']) < min_age]
-        
-        # Database blacklist check
-        blacklisted_coins = pd.read_sql(
-            "SELECT address FROM blacklist WHERE type = 'coin'",
-            self.engine
-        )['address'].tolist()
-        
-        blacklisted_devs = pd.read_sql(
-            "SELECT address FROM blacklist WHERE type = 'dev'",
-            self.engine
-        )['address'].tolist()
-        
-        # Address and symbol checks
-        df = df[
-            ~df['pair_address'].isin(blacklisted_coins) &
-            ~df['base_token_address'].isin(blacklisted_coins) &
-            ~df['creator_address'].isin(blacklisted_devs) &
-            ~df['base_token_name'].isin(CONFIG["FILTERS"]["coin_blacklist"])
-        ]
-        
-        return df
+def execute_trade(action, token_address, amount):
+    """Execute a trade using BonkBot."""
+    payload = {
+        "action": action,  # "buy" or "sell"
+        "token_address": token_address,
+        "amount": amount,
+        "api_key": BONKBOT_API_KEY
+    }
+    response = requests.post(BONKBOT_API_URL, json=payload)
+    if response.status_code == 200:
+        print(f"Trade executed: {action} {amount} of {token_address}")
+        telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Trade executed: {action} {amount} of {token_address}")
+        return True
+    else:
+        print(f"Failed to execute trade: {response.text}")
+        return False
 
-    def process_data(self, raw_data: List[Dict]) -> pd.DataFrame:
-        """Enhanced data processing with security fields"""
-        df = pd.DataFrame(raw_data)[[
-            'pairAddress', 'baseToken', 'quoteToken', 'priceUsd',
-            'liquidity', 'volume', 'chainId', 'dexId', 'createdAt'
-        ]]
-        
-        processed = pd.DataFrame({
-            'pair_address': df['pairAddress'],
-            'base_token_name': df['baseToken'].apply(lambda x: x['name']),
-            'base_token_address': df['baseToken'].apply(lambda x: x['address']),
-            'quote_token_address': df['quoteToken'].apply(lambda x: x['address']),
-            'price': pd.to_numeric(df['priceUsd']),
-            'liquidity': pd.to_numeric(df['liquidity']),
-            'volume_24h': pd.to_numeric(df['volume']['h24']),
-            'chain': df['chainId'],
-            'exchange': df['dexId'],
-            'created_at': pd.to_datetime(df['createdAt'], unit='ms'),
-            'timestamp': datetime.utcnow()
-        })
-        
-        # Apply security filters
-        processed = self.apply_filters(processed)
-        
-        return processed
+def save_token_data(token_data):
+    """Save token data to the database if it passes all checks."""
+    if is_blacklisted(token_data):
+        return
+    if not passes_filters(token_data):
+        return
+    if is_fake_volume(token_data):
+        return
 
-    def detect_anomalies(self, new_data: pd.DataFrame) -> pd.DataFrame:
-        """Anomaly detection with blacklist awareness"""
-        if not new_data.empty:
-            features = new_data[['price', 'liquidity', 'volume_24h']]
-            features = np.log1p(features)
-            
-            self.model.fit(self.historical_data)
-            anomalies = self.model.predict(features)
-            new_data['anomaly_score'] = self.model.decision_function(features)
-            return new_data[anomalies == -1]
-        return pd.DataFrame()
+    update_blacklists(token_data)
+    if is_blacklisted(token_data):
+        return
 
-    def analyze_market_events(self, anomalous_data: pd.DataFrame):
-        """Enhanced analysis with blacklist monitoring"""
-        for _, row in anomalous_data.iterrows():
-            # Check for blacklist pattern matches
-            if self._detect_blacklist_pattern(row):
-                self._log_event(row, 'BLACKLIST_PATTERN')
-            
-            # Existing detection logic
-            ...
+    conn = sqlite3.connect("dex_data.db")
+    cursor = conn.cursor()
+    token = token_data.get('pairs', [{}])[0]
+    cursor.execute('''
+        INSERT OR REPLACE INTO tokens (
+            token_address, name, price_usd, liquidity, volume_24h, market_cap, dev_address
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        token.get('baseToken', {}).get('address'),
+        token.get('baseToken', {}).get('name'),
+        token.get('priceUsd'),
+        token.get('liquidity', {}).get('usd'),
+        token.get('volume', {}).get('h24'),
+        token.get('fdv'),
+        token.get('baseToken', {}).get('deployer')
+    ))
+    conn.commit()
+    conn.close()
+    print(f"Saved data for token: {token['baseToken']['address']}")
 
-    def _detect_blacklist_pattern(self, row: pd.Series) -> bool:
-        """Detect patterns matching known blacklist characteristics"""
-        # Check for new addresses similar to blacklisted ones
-        similar_coins = pd.read_sql(f"""
-            SELECT COUNT(*) FROM blacklist
-            WHERE type = 'coin'
-            AND similarity(address, '{row['base_token_address']}') > 0.8
-            """, self.engine).scalar()
-        
-        similar_devs = pd.read_sql(f"""
-            SELECT COUNT(*) FROM blacklist
-            WHERE type = 'dev'
-            AND similarity(address, '{row['creator_address']}') > 0.8
-            """, self.engine).scalar()
-        
-        return similar_coins > 0 or similar_devs > 0
+def run_bot():
+    """Run the bot periodically."""
+    while True:
+        token_addresses = ["0xToken1", "0xToken2"]  # Replace with actual token addresses
+        for address in token_addresses:
+            token_data = fetch_token_data(address)
+            if token_data:
+                save_token_data(token_data)
+                if not is_blacklisted(token_data):
+                    execute_trade("buy", address, 1)  # Replace with your trading logic
 
-    def add_to_blacklist(self, address: str, list_type: str, reason: str):
-        """Programmatically add entries to blacklist"""
-        with self.engine.connect() as conn:
-            conn.execute(
-                """INSERT INTO blacklist (address, type, reason)
-                   VALUES (%s, %s, %s)
-                   ON CONFLICT (address) DO UPDATE SET reason = EXCLUDED.reason""",
-                (address, list_type, reason)
-            )
+        time.sleep(3600)  # Wait for 1 hour before the next run
 
-    def run(self):
-        """Enhanced main loop with filtering"""
-        while True:
-            try:
-                raw_data = self.fetch_pair_data()
-                processed_data = self.process_data(raw_data)
-                
-                if not processed_data.empty:
-                    anomalies = self.detect_anomalies(processed_data)
-                    self.analyze_market_events(anomalies)
-                    
-                    processed_data.to_sql(
-                        'pairs', self.engine, 
-                        if_exists='append', index=False
-                    )
-                    
-                    self.historical_data = pd.concat(
-                        [self.historical_data, processed_data]
-                    ).tail(100000)
-                
-                # Update blacklists periodically
-                self._refresh_blacklists()
-                time.sleep(60)  # Add sleep between iterations
-
-            except Exception as e:
-                print(f"Runtime error: {e}")
-
-    def _refresh_blacklists(self):
-        """Refresh blacklists from external sources"""
-        # Example: Sync with community-maintained blacklists
-        try:
-            response = requests.get("https://api.gopluslabs.io/api/v1/token_security/1")
-            data = response.json()
-            for token in data['tokens']:
-                if token['is_honeypot']:
-                    self.add_to_blacklist(
-                        token['contract_address'], 
-                        'coin', 
-                        'Automated honeypot detection'
-                    )
-        except Exception as e:
-            print(f"Blacklist refresh failed: {e}")
-
-# Example usage with blacklist management
 if __name__ == "__main__":
-    bot = EnhancedDexScreenerBot()
-    
-    # Manually add suspicious entry
-    bot.add_to_blacklist(
-        "0xNEW...SCAM", 
-        "dev", 
-        "Suspicious deployment pattern"
-    )
-    
-    bot.run()
+    run_bot()
