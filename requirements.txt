@@ -1,6 +1,9 @@
 streamlit
 requests
 pandas
+numpy
+psycopg2-binary
+sqlalchemy
+scikit-learn
 python-telegram-bot
 beautifulsoup4
-psycopg2-binary
