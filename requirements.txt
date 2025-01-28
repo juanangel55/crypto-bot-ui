@@ -3,5 +3,5 @@ requests
 pandas
 python-telegram-bot
 beautifulsoup4
-psychopg2-binary
+psycopg2-binary
 psycopg2  
