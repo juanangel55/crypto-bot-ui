@@ -1,0 +1,6 @@
+streamlit
+requests
+pandas
+sqlite3
+python-telegram-bot
+beautifulsoup4
