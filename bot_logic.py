@@ -1,4 +1,3 @@
-# bot_logic.py
 import requests
 import pandas as pd
 import numpy as np
@@ -232,4 +231,13 @@ class EnhancedDexScreenerBot:
 
 # Example usage with blacklist management
 if __name__ == "__main__":
-    bot = EnhancedDexScreenerBot
+    bot = EnhancedDexScreenerBot()
+    
+    # Manually add suspicious entry
+    bot.add_to_blacklist(
+        "0xNEW...SCAM", 
+        "dev", 
+        "Suspicious deployment pattern"
+    )
+    
+    bot.run()
