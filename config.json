@@ -1,0 +1,24 @@
+{
+  "filters": {
+    "min_liquidity": 10000,
+    "min_volume_24h": 5000,
+    "max_market_cap": 100000000
+  },
+  "blacklist": {
+    "coins": ["0xRugCoin1", "0xRugCoin2"],
+    "devs": ["0xBadDev1", "0xBadDev2"]
+  },
+  "fake_volume_detection": {
+    "volume_liquidity_ratio_threshold": 100,
+    "price_stability_threshold": 1,
+    "use_pocket_universe": true
+  },
+  "rugcheck": {
+    "enabled": true,
+    "min_rating": "Good"
+  },
+  "bundled_supply": {
+    "enabled": true,
+    "threshold": 0.9
+  }
+}
